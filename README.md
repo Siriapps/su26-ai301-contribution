@@ -6,7 +6,7 @@ This is my contribution log for Codepath AI 301 course
 **Contribution Number:** 1  
 **Student:** Lakshmi Siri Appalaneni  
 **Issue:** https://github.com/BasedHardware/omi/issues/5092  
-**Status:** Phase I In Progress
+**Status:** Phase I Complete
 
 ---
 
