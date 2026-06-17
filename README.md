@@ -188,7 +188,16 @@ Environment setup complete on Windows (Pixel_7 emulator, whisper path override, 
 **Contribution Number:** 2  
 **Student:** Lakshmi Siri Appalaneni  
 **Issue:** [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313)  
-**Status:** Phase II Complete
+**Status:** Phase IV Complete — Awaiting review
+
+**Phase summary:**
+
+| Phase | Status |
+|-------|--------|
+| Phase I — Issue selection | Complete |
+| Phase II — Reproduction & plan | Complete |
+| Phase III — Implementation | Complete |
+| Phase IV — Pull request | Submitted — awaiting review |
 
 ---
 
@@ -234,37 +243,42 @@ I forked [lance-format/lance](https://github.com/lance-format/lance) to [Siriapp
 **Blockers encountered and resolved:**
 
 1. **`protoc` / proto path failure** — Git symlink stubs at `rust/*/protos` (pointing to `../../protos/`) do not resolve on Windows; `cargo check` failed with `Could not make proto path relative: ./protos/encodings_v2_0.proto`.
-   - **Fix:** Created Windows directory junctions from each `rust/*/protos` to the repo-root `protos/` folder. Re-run `git restore rust/*/protos` after builds to keep the working tree clean; recreate junctions before the next `cargo` command.
-2. **First `cargo check` compile time** — Full workspace compile on Windows took ~6 minutes (expected for first build).
+   - **Fix:** Created Windows directory junctions from each `rust/*/protos` to the repo-root `protos/` folder. Recreate junctions before each `cargo` session; do not commit junction changes.
+2. **`protoc` not in PATH** — After junction setup, builds failed with `Could not find protoc`.
+   - **Fix:** Installed via `winget install protobuf`; refreshed shell PATH.
+3. **First `cargo check` compile time** — Full workspace compile on Windows took ~6 minutes (expected for first build).
 
-**Current status:** `cargo check -p lance-index` succeeds. Working branch: [`fix-issue-7313`](https://github.com/Siriapps/lance/tree/fix-issue-7313). Reproduction test committed as `240045ec`.
+**Current status:** `cargo check -p lance-index` and `cargo test -p lance-index` succeed. Working branch: [`fix-issue-7313`](https://github.com/Siriapps/lance/tree/fix-issue-7313).
 
 ### Steps to Reproduce
 
 1. Fork [lance-format/lance](https://github.com/lance-format/lance) and clone your fork.
-2. On Windows, create proto junctions (see Environment Setup above).
+2. On Windows, create proto junctions and install `protoc` (see Environment Setup above).
 3. Create branch: `git checkout -b fix-issue-7313` and push to your fork.
 4. Verify build: `cargo check -p lance-index`
-5. Run the reproduction test:
+5. **Pre-fix (Phase II):** Run reproduction test with `#[should_panic]` — confirms panic:
 
 ```bash
 cargo test -p lance-index test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len -- --nocapture
 ```
 
-6. **Observed result (current main / pre-fix):** Test passes via `#[should_panic]` — worker panics with:
+   Observed: `index out of bounds: the len is 1731 but the index is 4456`
 
-```
-index out of bounds: the len is 1731 but the index is 4456
+6. **Post-fix (Phase III):** Run regression test — confirms fix:
+
+```bash
+cargo test -p lance-index test_process_batch_with_position_handles_token_id_gaps -- --nocapture
 ```
 
-7. **How the test simulates production:** It pre-populates `worker.builder` with 1731 tokens, sets stale `tokens.next_id = 4456` (mimicking legacy FTS partitions), sizes `posting_lists` to 1731, then calls `process_batch` with a new unseen token. `tokens.add()` assigns id 4456; the `==` guard does not grow the vector; line 1344 panics.
+7. **How the test simulates production:** Pre-populates `worker.builder` with 1731 tokens, sets stale `tokens.next_id = 4456` (mimicking legacy FTS partitions), sizes `posting_lists` to 1731, then calls `process_batch` with a new token. Before the fix, `tokens.add()` assigns id 4456 and the `==` guard does not grow the vector; line 1344 panics. After the fix, `posting_lists` grows to 4457 and indexing completes.
 
 ### Reproduction Evidence
 
 - **Branch link:** https://github.com/Siriapps/lance/tree/fix-issue-7313
-- **Commit:** `240045ec` — `test: reproduce FTS posting_lists index panic for issue #7313`
-- **Test file:** `rust/lance-index/src/scalar/inverted/builder.rs` — `test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len`
-- **Panic location:** `builder.rs:1344` — `&mut builder.posting_lists[token_id as usize]`
+- **Commits:** `3f41a34f` (regression test), `66b981b4` (fix) — rebased on upstream main
+- **Test file:** `rust/lance-index/src/scalar/inverted/builder.rs` — `test_process_batch_with_position_handles_token_id_gaps`
+- **Panic location (pre-fix):** `builder.rs:1344` — `&mut builder.posting_lists[token_id as usize]`
+- **Upstream PR:** https://github.com/lance-format/lance/pull/7330
 
 ---
 
@@ -281,7 +295,7 @@ index out of bounds: the len is 1731 but the index is 4456
 
 **Why `token_id` can exceed `len`:** `TokenSet::add()` returns `next_id` for new tokens. If `next_id` is stale (higher than the number of posting lists built so far) — from legacy index partitions written before #7115, or from a vocabulary/posting-list desync during optimize — the equality check fails and the vector is never grown to the required size.
 
-**Why the issue's suggested fix (`==` → `>=` + one push) is insufficient:** For `len=1731` and `token_id=4456`, one push yields `len=1732` — still out of bounds at index 4456. The correct approach is `resize_with(token_id + 1, ...)` to fill the entire gap.
+**Why the issue's suggested fix (`==` → `>=` + one push) is insufficient:** For `len=1731` and `token_id=4456`, one push yields `len=1732` — still out of bounds at index 4456. The correct approach is `resize_with(token_idx + 1, ...)` to fill the entire gap.
 
 **Prior art in the same file:**
 
@@ -291,7 +305,7 @@ index out of bounds: the len is 1731 but the index is 4456
 
 ### Proposed Solution
 
-Replace the `==` + single `push` block in the `with_position` token loop with `resize_with(token_idx + 1, ...)`, preserving the existing `memory_size` overhead tracking. No Python/Java binding changes — logic stays in Rust core per Lance AGENTS.md.
+Replace the `==` + single `push` block in the `with_position` token loop with `resize_with(token_idx + 1, ...)`, preserving the existing `memory_size` overhead tracking. No Python/Java binding changes — logic stays in Rust core per CONTRIBUTING.md and AGENTS.md.
 
 ### Implementation Plan
 
@@ -301,83 +315,13 @@ Using UMPIRE framework (adapted):
 
 **Match:** Non-position branch (`resize_with`), `merge_from` (`resize_with`), stale-`next_id` regression tests.
 
-**Plan — Step by step** (single file: `rust/lance-index/src/scalar/inverted/builder.rs`):
+**Plan:** Single-file change in `rust/lance-index/src/scalar/inverted/builder.rs` — fix resize guard + regression test.
 
-**Step 1 — Fix resize guard (~lines 1325–1342)**
+**Implement:** https://github.com/Siriapps/lance/tree/fix-issue-7313
 
-Replace:
+**Review:** Conventional Commits PR title (`fix:`), tests required per CONTRIBUTING.md, no drive-by changes.
 
-```rust
-if token_id as usize == builder.posting_lists.len() {
-    let old_posting_lists_overhead_size = ...;
-    builder.posting_lists.push(
-        PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec),
-    );
-    let new_posting_lists_overhead_size = ...;
-    Self::adjust_tracked_value(memory_size, old, new);
-}
-```
-
-With:
-
-```rust
-let token_idx = token_id as usize;
-if token_idx >= builder.posting_lists.len() {
-    let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
-        * std::mem::size_of::<PostingListBuilder>()) as u64;
-    builder.posting_lists.resize_with(token_idx + 1, || {
-        PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec)
-    });
-    let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
-        * std::mem::size_of::<PostingListBuilder>()) as u64;
-    Self::adjust_tracked_value(
-        memory_size,
-        old_posting_lists_overhead_size,
-        new_posting_lists_overhead_size,
-    );
-}
-```
-
-**Step 2 — Flip reproduction test (~lines 3753–3797)**
-
-- Rename: `test_process_batch_with_position_panics_...` → `test_process_batch_with_position_handles_token_id_gaps`
-- Remove: `#[should_panic(expected = "index out of bounds")]`
-- Add after `process_batch`:
-
-```rust
-let new_token_id = worker.builder.tokens.get("unseen_token_xyz").expect("new token indexed");
-assert!((new_token_id as usize) < worker.builder.posting_lists.len());
-assert_eq!(worker.builder.posting_lists.len(), 4457);
-```
-
-**Step 3 — Verify**
-
-```bash
-cargo test -p lance-index test_process_batch_with_position_handles_token_id_gaps -- --nocapture
-cargo test -p lance-index test_worker_trims_position_temp_buffers
-cargo test -p lance-index test_worker_flush_keeps_position_temp_memory_bounded
-cargo test -p lance-index
-cargo fmt --all
-cargo clippy -p lance-index --tests -- -D warnings
-```
-
-**Step 4 — Commit and push**
-
-```bash
-git commit -m "fix: grow posting_lists before indexed access in FTS with_position builder"
-git push origin fix-issue-7313
-```
-
-**Implement:** https://github.com/Siriapps/lance/tree/fix-issue-7313 (Phase III commits pending)
-
-**Review:** Before PR — Conventional Commits title (`fix:`), no drive-by changes, tests required per AGENTS.md.
-
-**Evaluate:**
-
-- New regression test passes (no panic)
-- Existing position worker tests pass
-- Full `cargo test -p lance-index` passes
-- `cargo fmt` and `cargo clippy` clean
+**Evaluate:** `cargo test -p lance-index` (635 tests), `cargo fmt --all`; upstream Linux CI on PR #7330.
 
 ---
 
@@ -385,10 +329,12 @@ git push origin fix-issue-7313
 
 ### Unit Tests
 
-- [x] `test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len` — reproduces #7313 (Phase II)
-- [ ] `test_process_batch_with_position_handles_token_id_gaps` — confirms fix (Phase III)
-- [ ] Existing: `test_worker_trims_position_temp_buffers`, `test_worker_flush_keeps_position_temp_memory_bounded`
-- [ ] Existing: `test_merge_from_after_remap_does_not_panic`, `test_merge_with_stale_next_id_token_file_does_not_panic`
+- [x] `test_process_batch_with_position_handles_token_id_gaps` — regression test for #7313 (stale `next_id`, `len=1731`, `token_id=4456`)
+- [x] `test_worker_trims_position_temp_buffers` — existing position worker test still passes
+- [x] `test_worker_flush_keeps_position_temp_memory_bounded` — existing position worker test still passes
+- [x] `test_merge_from_after_remap_does_not_panic` — related stale token ID path (existing)
+- [x] `test_merge_with_stale_next_id_token_file_does_not_panic` — related stale token ID path (existing)
+- [x] Full suite: `cargo test -p lance-index` — 635 tests passed locally on Windows
 
 ### Integration Tests
 
@@ -396,7 +342,7 @@ git push origin fix-issue-7313
 
 ### Manual Testing
 
-N/A — Rust unit test is sufficient for this bounded vector-index bug.
+N/A — Rust unit test is sufficient for this bounded vector-index bug. Upstream CI validates on Linux via [PR #7330](https://github.com/lance-format/lance/pull/7330).
 
 ---
 
@@ -404,36 +350,55 @@ N/A — Rust unit test is sufficient for this bounded vector-index bug.
 
 ### Week 2 Progress (Phase II)
 
-- Selected issue #7313 after Contribution 1 stopped.
+- Selected [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313) after Contribution 1 stopped.
 - Created branch `fix-issue-7313`, pushed to [Siriapps/lance](https://github.com/Siriapps/lance).
-- Resolved Windows proto junction blocker.
-- Added and ran reproduction test; confirmed exact panic: `the len is 1731 but the index is 4456`.
+- Resolved Windows proto junction and `protoc` blockers.
+- Added reproduction test (`#[should_panic]`); confirmed exact panic: `the len is 1731 but the index is 4456`.
 - Documented fix plan: `resize_with(token_idx + 1)` not `>=` + single push.
 
-### Code Changes (Phase II only)
+### Week 3 Progress (Phase III)
 
-- **File:** `rust/lance-index/src/scalar/inverted/builder.rs`
-- **Commit:** `240045ec` — reproduction test only (no fix yet)
+- Implemented fix in `IndexWorker::process_batch()` `with_position` loop: `resize_with(token_idx + 1, ...)` with `memory_size` overhead tracking preserved.
+- Renamed test to `test_process_batch_with_position_handles_token_id_gaps`; removed `#[should_panic]`; added success assertions (`posting_lists.len() == 4457`).
+- Used single-word test token `xyzzunique7313` with `stem(false)` / `lower_case(false)` so tokenizer output is predictable.
+- Ran `cargo test -p lance-index` — all 635 tests passed; `cargo fmt --all` applied.
+- Commits: `3f41a34f` (test), `66b981b4` (fix); rebased on upstream main.
+
+### Code Changes
+
+- **File:** `rust/lance-index/src/scalar/inverted/builder.rs` (only file changed)
+- **Lines changed:** +61 / −4
 
 ---
 
 ## Pull Request
 
-**PR Link:** Not yet submitted — awaiting review before opening upstream PR
+**PR Link:** https://github.com/lance-format/lance/pull/7330
 
-**Draft PR title:** `fix: grow posting_lists before indexed access in FTS with_position builder`
+**PR Description:**
 
-**Draft PR body:**
+**What does this PR do?** Fixes an index out of bounds panic in `IndexWorker::process_batch()` when FTS indexing runs with `with_position: true` (the default). The `with_position` branch now grows `posting_lists` with `resize_with(token_idx + 1, ...)` before indexing by `token_id`, matching the pattern used in the non-position branch and in `merge_from`.
 
-> Fixes #7313  
-> Replaces `token_id == posting_lists.len()` + single push with `resize_with(token_id + 1, ...)` in the `with_position` branch of `IndexWorker::process_batch`  
-> Adds regression test for stale `next_id` / posting-list length mismatch
+**Why was this PR needed?** When `tokens.add()` returns a `token_id` greater than `posting_lists.len()` — e.g. after loading a legacy FTS partition with a stale `next_id` during `optimize_indices` — the old code only grew the vector on exact equality (`token_id == len`). Reported in production with `posting_lists.len()=1731` and `token_id=4456` ([#7313](https://github.com/lance-format/lance/issues/7313)).
+
+**What are the relevant issue numbers?** Closes #7313
+
+**Does this PR meet the acceptance criteria?** (per CONTRIBUTING.md)
+
+- [x] Tests added for new/changed behavior
+- [x] All tests passing (`cargo test -p lance-index`)
+- [x] Follows project style guide (`cargo fmt --all`)
+- [x] Conventional Commits PR title (`fix:`)
+- [x] No breaking changes introduced
+- [x] Documentation updated — N/A (internal bug fix)
+
+Labels applied by maintainers: `bug`, `A-index`
 
 **Maintainer Feedback:**
 
-- (none yet)
+- Jun 17, 2026: PR opened manually. Tagged @sinianluoye on the PR. Awaiting first review. CI running on Linux.
 
-**Status:** Phase II Complete — fix implementation pending
+**Status:** Awaiting review
 
 ---
 
@@ -441,25 +406,30 @@ N/A — Rust unit test is sufficient for this bounded vector-index bug.
 
 ### Technical Skills Gained
 
-- Reading Rust FTS index builder code (`IndexWorker`, `TokenSet`, `PostingListBuilder`).
-- Writing `#[tokio::test]` reproduction tests with `#[should_panic]`.
-- Windows-specific OSS setup (proto symlink → junction workaround).
+- Reading and debugging Rust FTS index builder code (`IndexWorker`, `TokenSet`, `PostingListBuilder`).
+- Writing `#[tokio::test]` reproduction and regression tests in a large Rust workspace.
+- Windows OSS setup for Lance: proto symlink junctions, `protoc` install, first-time `cargo` builds.
+- Opening a fork-based PR to upstream with Conventional Commits title and CONTRIBUTING.md-aligned description.
 
 ### Challenges Overcome
 
-- Git symlink stubs not resolving on Windows for `protoc` build.
-- Understanding why `>=` + one push is insufficient for large token ID gaps.
+- Git symlink stubs not resolving on Windows for `protoc` builds.
+- Understanding why the issue's suggested fix (`>=` + one push) is insufficient for large token ID gaps.
+- Separating environment setup noise from the actual one-file bug fix.
 
 ### What I'd Do Differently Next Time
 
-- Check for platform-specific build issues (symlinks) earlier in environment setup.
-- Verify issue-suggested fix against worst-case production numbers before implementing.
+- Set up proto junctions and `protoc` once at the start of Week 2 instead of rediscovering on each session.
+- Clone Rust repos outside OneDrive-synced folders if file-attribute issues recur.
+- Check for competing PRs on the issue before investing in implementation (learned from Contribution 1).
 
 ---
 
 ## Resources Used
 
-- [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313)
-- [Siriapps/lance — fix-issue-7313](https://github.com/Siriapps/lance/tree/fix-issue-7313)
-- Lance `rust/lance-index/src/scalar/inverted/builder.rs` — `process_batch`, `merge_from`, stale-`next_id` tests
-- Lance AGENTS.md — testing and PR conventions
+- [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313) — bug report
+- [lance-format/lance#7330](https://github.com/lance-format/lance/pull/7330) — my pull request
+- [Siriapps/lance — fix-issue-7313](https://github.com/Siriapps/lance/tree/fix-issue-7313) — fork branch
+- CONTRIBUTING.md — tests required, Conventional Commits, critical-fix label guidance
+- `rust/CONTRIBUTING.md` — `cargo fmt`, `cargo clippy`, `cargo test`
+- `rust/lance-index/src/scalar/inverted/builder.rs` — `process_batch`, `merge_from`, stale-`next_id` tests
