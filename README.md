@@ -1,12 +1,15 @@
 # su26-ai301-contribution
+
 This is my contribution log for Codepath AI 301 course
+
+---
 
 # Contribution 1: Feature: Trash bin / soft delete for conversations, memories, and tasks
 
 **Contribution Number:** 1  
 **Student:** Lakshmi Siri Appalaneni  
 **Issue:** [BasedHardware/omi#5092](https://github.com/BasedHardware/omi/issues/5092)  
-**Status:** Phase II Complete
+**Status:** Stopped — upstream PR submitted by another contributor; work halted at Phase II
 
 ---
 
@@ -53,8 +56,6 @@ I forked and cloned the [BasedHardware/omi](https://github.com/BasedHardware/omi
 
 **Current status:** Environment setup complete. `flutter run --flavor dev` builds and runs on the Pixel_7 emulator. Working branch: [`fix-issue-5092`](https://github.com/Siriapps/omi/tree/fix-issue-5092).
 
-See **Week 2 Progress** under Implementation Notes for full detail on each blocker, error messages, root causes, and fixes.
-
 ### Steps to Reproduce
 
 1. Fork [BasedHardware/omi](https://github.com/BasedHardware/omi) and clone your fork locally (e.g. `git clone https://github.com/Siriapps/omi.git`).
@@ -80,180 +81,76 @@ See **Week 2 Progress** under Implementation Notes for full detail on each block
 
 The missing Trash feature is not a single bug but a **systemic hard-delete architecture** across backend and app, compounded by a prior soft-delete rollback.
 
-**Backend — delete means destroy.** All three content types follow the same pattern: the public DELETE route calls a database helper that invokes Firestore `.delete()` on the document, then immediately runs destructive side effects in the same request:
-- **Conversations** (`routers/conversations.py:382` → `database/conversations.py:540`): hard delete + Pinecone vector purge + cascade deletion of related audio, memory vectors, and action items.
-- **Memories** (`routers/memories.py:172` → `database/memories.py:290`): hard delete + `delete_memory_vector`.
-- **Action items** (`routers/action_items.py:448` → `database/action_items.py:491`): hard delete + vector purge + FCM reminder cancellation.
+**Backend — delete means destroy.** All three content types follow the same pattern: the public DELETE route calls a database helper that invokes Firestore `.delete()` on the document, then immediately runs destructive side effects in the same request.
 
-There is no intermediate "trashed" state, no restore endpoint, and no trash-list query. Once the DELETE handler completes, the data and its embeddings are gone.
+**Historical rollback blocks naive reintroduction.** Omi previously used a `deleted: bool` soft-delete flag, but commit `d3a2aa6cf` removed it. The migration script `backend/migration/remove_soft_deleted_documents.py` still actively purges any document where `deleted == True`. A new field — `deleted_at: Optional[datetime]` — is required.
 
-**Historical rollback blocks naive reintroduction.** Omi previously used a `deleted: bool` soft-delete flag, but commit `d3a2aa6cf` ("No more soft-delete on database #2515") removed it. The migration script `backend/migration/remove_soft_deleted_documents.py` still actively purges any document where `deleted == True`. Reusing that field would risk existing docs being destroyed by the migration. A new field — `deleted_at: Optional[datetime]` — is required and is safe: the migration's `FieldFilter('deleted', '==', True)` will never match it, and legacy documents without `deleted_at` naturally read as active (no data migration needed).
+**App — cosmetic undo, not real recovery.** The Flutter layer has partial UX hints but no server-backed Trash.
 
-**App — cosmetic undo, not real recovery.** The Flutter layer has partial UX hints but no server-backed Trash:
-- **Memories:** a 4-second client-side "Undo" toast (`memories/page.dart:53-119`) that only works if the delete request has not yet completed.
-- **Conversations:** a 3-second delay plus an `undoDeletedConversation()` method (`conversation_provider.dart:799`) that is wired but unused in the main flow.
-- **Action items:** no undo at all.
-- **Nowhere:** no Trash tab/screen, no restore API call, no permanent-delete confirmation flow, no auto-purge setting, no bulk empty-trash action.
-
-**Root cause summary:** Deletion was intentionally simplified to hard delete in PR #2515. Issue #5092 asks to reintroduce recoverable deletion, but the implementation must be greenfield (new field, new endpoints, new UI) while deferring Pinecone/GCS/FCM cleanup to a separate permanent-delete path — otherwise soft delete would still destroy recoverability.
+**Root cause summary:** Deletion was intentionally simplified to hard delete in PR #2515. Issue #5092 asks to reintroduce recoverable deletion, but the implementation must be greenfield (new field, new endpoints, new UI) while deferring Pinecone/GCS/FCM cleanup to a separate permanent-delete path.
 
 ### Proposed Solution
 
-Reintroduce **soft delete via `deleted_at`** across conversations, memories, and action items, backed by new API routes and surfaced in the Flutter app as a Trash experience with undo toasts and configurable auto-purge.
-
-**Backend changes:**
-1. Add `deleted_at: Optional[datetime] = None` to all three schemas. Leave `discarded` on conversations untouched (it means "failed processing", not user deletion).
-2. Refactor DB layer: rename existing `delete_*` → `permanently_delete_*`; add `soft_delete_*`, `restore_*`, `get_trashed_*`; filter `deleted_at is None` in all list/get queries (mirroring the existing `invalid_at` pattern on memories).
-3. Flip existing DELETE handlers to soft-delete only (stamp `deleted_at`, no vector/audio purge). Add per-type routes: `POST .../restore`, `DELETE .../permanent`, `GET .../trash` (plus `POST .../trash/empty` for action items).
-4. Move all destructive side effects (Pinecone, GCS audio, FCM, cascade deletes) into the permanent-delete path only — triggered by explicit user action or the auto-purge job.
-5. Add a daily auto-purge job (`trash_purge.py`) wired into the existing Cloud Run job infrastructure, default 30-day retention (`TRASH_RETENTION_DAYS`), with optional per-user override via `users/{uid}.trash_retention_days`.
-
-**Flutter changes:**
-1. Extend API clients and models (`DateTime? deletedAt`) for restore, permanent delete, trash list, and empty trash.
-2. Wire providers with trashed-item lists and undo flows; extract the memory undo toast into a shared `showUndoToast()` used by all three content types.
-3. Add a reusable `TrashListView` (restore + delete-forever per row, empty-trash in app bar, "Auto-deletes in N days" label), reachable from each content type's overflow menu.
-4. Add a retention setting (15 / 30 / 60 days) persisted locally and synced to Firestore.
-5. Add l10n keys for all trash-related strings across locales.
-
-**Design constraints:**
-- Filter trashed items in Python (`doc.get('deleted_at') is None`), not via new Firestore composite indexes — same approach as `invalid_at`.
-- For conversations, add `include_trashed=False` query param analogous to existing `include_discarded`.
-- On soft-delete of action items, still cancel FCM reminders immediately (user expectation), but defer vector deletion to permanent delete.
-- Land changes in staged PRs (backend models → endpoint flip → purge job → Flutter) to keep reviews manageable.
+Reintroduce **soft delete via `deleted_at`** across conversations, memories, and action items, backed by new API routes and surfaced in the Flutter app as a Trash experience with undo toasts and configurable auto-purge. Full six-step plan saved in `implementation_plan.md`.
 
 ### Implementation Plan
 
 Using UMPIRE framework (adapted):
 
-**Understand:** Deleting a conversation, memory, or task in Omi is instant and permanent. All three backend DELETE endpoints call Firestore `.delete()` and immediately purge Pinecone vectors, GCS audio, and FCM reminders in the same request. The app has no Trash folder, no restore API, and no auto-purge — only brief client-side undo toasts that cannot recover data once the server request completes. A prior `deleted: bool` soft-delete was removed and must not be reused.
+**Understand:** Deleting a conversation, memory, or task in Omi is instant and permanent.
 
-**Match:** Existing codebase patterns to reuse:
-- `invalid_at` on memories (`memories.py:112-116`) — Python-side filtering without new Firestore indexes; `deleted_at` follows this model.
-- `discarded` + `include_discarded` on conversations — template for `include_trashed` (separate semantics: discarded = failed processing).
-- `invalidate_memory()` (`memories.py:269`) — stamp-a-timestamp instead of delete; model for `soft_delete_memory()`.
-- Memory undo toast overlay (`memories/page.dart:53-119`) — reference UX for shared `showUndoToast()`.
-- Hourly Cloud Run notification job (`jobs.py`, `notifications.should_run_job`) — reuse job gating pattern for daily trash auto-purge.
+**Match:** `invalid_at` filtering pattern, `discarded` + `include_discarded`, memory undo toast UX, Cloud Run job gating.
 
-**Plan:** Six-step implementation (full file-level detail in `implementation_plan.md`):
+**Plan:** Six-step backend + Flutter implementation (models → DB layer → routers → purge job → Flutter clients → Trash UI).
 
-| Step | Scope | Key files |
-|------|-------|-----------|
-| 1 | Backend models — add `deleted_at` | `conversation.py`, `memories.py` (MemoryDB), action-item response model |
-| 2 | Backend DB layer — soft/restore/trash-list + query filters | `database/conversations.py`, `database/memories.py`, `database/action_items.py` |
-| 3 | Backend routers — flip DELETE to soft; add restore/permanent/trash routes | `routers/conversations.py`, `routers/memories.py`, `routers/action_items.py` |
-| 4 | Auto-purge job — 30-day retention | `utils/other/trash_purge.py`, `utils/other/jobs.py` |
-| 5 | Flutter — API clients, schema, providers, undo toasts | `conversations.dart`, `memories.dart`, action-items client, providers |
-| 6 | Flutter — Trash UI, empty-trash, retention setting, l10n | `TrashListView`, overflow menus, SharedPreferences + Firestore sync |
+**Implement:** https://github.com/Siriapps/omi/tree/fix-issue-5092
 
-Suggested PR sequence: (1) backend models + DB layer + unit tests, no behavior change; (2) endpoint flip + new routes; (3) auto-purge job; (4) Flutter schema + clients + providers; (5) Flutter Trash views + settings + l10n.
+**Review / Evaluate:** Backend `test.sh` + emulator manual testing per content type.
 
-**Implement:** https://github.com/Siriapps/omi/tree/fix-issue-5092 — feature implementation commits will land on this branch during Phase III.
+---
 
-**Review:** Before opening upstream PRs, verify against Omi contribution guidelines:
-- [ ] No reuse of `deleted: bool` (migration collision).
-- [ ] `discarded` and `deleted_at` kept semantically separate on conversations.
-- [ ] Soft-delete does not call Pinecone/GCS/FCM purge; permanent-delete does.
-- [ ] List queries exclude trashed items; trash-list endpoint returns only trashed items ordered by `deleted_at` desc.
-- [ ] Legacy documents without `deleted_at` behave as active.
-- [ ] Backend formatted with `black --line-length 120 --skip-string-normalization`.
-- [ ] Flutter `*.g.dart` regenerated via `build_runner`, not hand-edited.
-- [ ] l10n keys added for all supported locales.
-- [ ] New backend tests added to `test.sh`.
+## Why Work Stopped
 
-**Evaluate:** Verification plan per content type:
+While preparing for Phase III implementation, another contributor submitted a pull request addressing [BasedHardware/omi#5092](https://github.com/BasedHardware/omi/issues/5092). Continuing would duplicate upstream work and risk merge conflicts. I completed Phase II (environment setup, reproduction via code tracing, and a detailed implementation plan) but did not open an upstream PR or land feature commits. I pivoted to a new issue in the Lance project for Contribution 2.
 
-*Backend (`bash test.sh`):*
-- Soft-delete stamps `deleted_at`; item disappears from list queries but remains fetchable by ID.
-- Restore clears `deleted_at` via `firestore.DELETE_FIELD`; item reappears in normal lists.
-- Permanent delete removes the Firestore doc and invokes vector/audio/FCM cleanup (mock-asserted); soft-delete does not.
-- Trash-list returns only soft-deleted docs, sorted by `deleted_at` descending.
-- Auto-purge removes only items older than retention; respects per-user `trash_retention_days` override.
-- Legacy docs without `deleted_at` validate as active; migration filter `deleted == True` never matches `deleted_at`.
+**Phase summary:**
 
-*App (Pixel_7 emulator / simulator):*
-- Swipe-delete conversation, memory, and task → undo toast appears → undo restores item.
-- Open Trash from overflow menu → restore one item, permanently delete another → confirm server state.
-- Empty trash → all trashed items permanently removed.
-- Change retention setting (15 / 30 / 60 days) → persists locally and syncs to Firestore.
+| Phase | Status |
+|-------|--------|
+| Phase I — Issue understanding | Complete |
+| Phase II — Reproduction & plan | Complete |
+| Phase III — Implementation | Not started (stopped) |
+| Phase IV — Pull request | Not started (stopped) |
 
 ---
 
 ## Testing Strategy
 
-### Unit Tests
-
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
-
-### Integration Tests
-
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
-
-### Manual Testing
-
-[What you tested manually and results]
+Not executed — work stopped before Phase III. Planned tests documented in `implementation_plan.md`.
 
 ---
 
 ## Implementation Notes
 
+### Week 1 Progress (Phase I)
 
-### Week 2 Progress
+- Selected [BasedHardware/omi#5092](https://github.com/BasedHardware/omi/issues/5092).
+- Forked upstream to [Siriapps/omi](https://github.com/Siriapps/omi) and created branch [`fix-issue-5092`](https://github.com/Siriapps/omi/tree/fix-issue-5092).
+- Traced all three backend delete paths and confirmed permanent deletion with no server-side Trash.
+- Investigated historical `deleted: bool` rollback (PR #2515); decided `deleted_at` is the safe reintroduction path.
+- Drafted full implementation plan (`implementation_plan.md`).
 
-**Focus:** Local development environment setup on Windows — getting the Flutter app building and running on an Android emulator. No feature code yet; this week was entirely infrastructure and toolchain work.
+### Week 2 Progress (Phase II)
 
-Omi's docs assume macOS for the desktop app and do not document Windows-specific pitfalls. The repo also lives under OneDrive, which introduced file-sync-related failures on top of platform issues. Getting from `git clone` to a running app on Pixel_7 took resolving **four separate blockers** in sequence:
-
-**1. Android emulator setup**
-- Installed Flutter SDK, Android Studio, and platform tools on Windows.
-- Created and booted a **Pixel_7** AVD — first time running a Flutter app target on this machine.
-- Confirmed `flutter doctor` passed Android toolchain checks before attempting `flutter run`.
-
-**2. `flutter pub get` — `whisper_flutter_new` git dependency failure**
-- **Error:** `pub get` failed when resolving the `whisper_flutter_new` package pulled from git.
-- **Root cause:** Dart-on-Windows has an ANSI-encoding bug that corrupts non-ASCII characters when parsing remote pubspec files. The dependency's pubspec contains **Japanese commas** in its description field, which get mangled on Windows and break resolution.
-- **Fix:** Vendored the package locally and added a **`path` override** in `pubspec.yaml` pointing to the local copy with an **ASCII-only description**. After the override, `flutter pub get` completed successfully.
-
-**3. `gen-l10n` — localization generation blocked**
-- **Error:** `flutter gen-l10n` failed when writing to `lib/l10n/`.
-- **Root cause:** OneDrive sync had silently set a **ReadOnly** attribute on localization files/directories, preventing the code generator from overwriting `.arb` outputs or generated Dart files.
-- **Fix:** Cleared the ReadOnly flag on affected paths under `lib/l10n/`. Re-ran `gen-l10n` successfully.
-- **Lesson:** Cloning Flutter projects into OneDrive-synced folders can cause subtle permission issues — worth checking file attributes when codegen fails with write errors.
-
-**4. `build_runner` — envied generator failure (non-blocking)**
-- **Error:** `dart run build_runner build` exited with failure after running all generators.
-- **Root cause:** The `envied` generator tripped on an **integration-test file** it was not meant to process. This is unrelated to the trash feature.
-- **Outcome:** All **6 required `.g.dart` files** for app development were generated successfully. Treated the envied failure as a non-blocking warning and proceeded.
-- **Decision:** Did not patch upstream integration-test layout this week — out of scope for #5092 and does not block local dev.
-
-**5. First Gradle build and app launch**
-- Ran `flutter run --flavor dev` targeting the Pixel_7 emulator.
-- First cold **Gradle build** took several minutes (expected for a large Flutter project on first compile).
-- App installed and launched successfully on the emulator — local dev environment is now fully operational for Phase III implementation and manual testing.
-
-**Week 2 outcome:** Environment setup complete. Can now implement and manually verify Trash UI flows on-device during Phase III. The effort this week was disproportionately spent on toolchain/platform issues rather than feature work, which is common when onboarding to a large cross-platform OSS project on a non-default OS.
-
-### Code Changes
-
-- **Files modified (Week 2 — local dev only, not yet pushed as feature PR):** `pubspec.yaml` (path override for `whisper_flutter_new`), vendored whisper package copy, ReadOnly attribute fixes on `lib/l10n/` (filesystem, not a code commit).
-- **Key commits:** Contribution log commits on `su26-ai301-contribution` (`first log - chose issue`, `Phase 1 complete`); omi fork branch [`fix-issue-5092`](https://github.com/Siriapps/omi/tree/fix-issue-5092) ready for Phase III implementation commits.
-- **Approach decisions:** Used code tracing to confirm reproduction before finishing app setup (validates issue even if emulator failed); chose `deleted_at` over `deleted: bool` after finding migration collision; staged PR plan to land backend before Flutter; path override for whisper rather than waiting on upstream Dart-on-Windows fix.
+Environment setup complete on Windows (Pixel_7 emulator, whisper path override, OneDrive ReadOnly fix on l10n, build_runner envied warning non-blocking). No feature code pushed upstream. Branch [`fix-issue-5092`](https://github.com/Siriapps/omi/tree/fix-issue-5092) remains available locally for reference.
 
 ---
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when submitted]
+**PR Link:** Not submitted — work stopped before PR
 
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
-
-**Maintainer Feedback:**
-- [Date]: [Summary of feedback received]
-- [Date]: [How you addressed it]
-
-**Status:** [Awaiting review / Iterating / Approved / Merged]
+**Status:** Stopped — upstream PR by another contributor
 
 ---
 
@@ -261,22 +158,308 @@ Omi's docs assume macOS for the desktop app and do not document Windows-specific
 
 ### Technical Skills Gained
 
-[What you learned technically]
+- Tracing delete flows across Python backend routers, database layer, and Flutter providers.
+- Understanding soft-delete design constraints (`deleted_at` vs legacy `deleted: bool` migration collision).
+- Windows Flutter OSS setup (emulator, dependency overrides, codegen).
 
 ### Challenges Overcome
 
-[What was hard and how you solved it]
+- Large Omi repo (~1+ GB) plus Android emulator made local builds slow and resource-heavy.
+- Windows-specific blockers: whisper pubspec encoding, OneDrive ReadOnly on l10n files.
 
 ### What I'd Do Differently Next Time
 
-[Reflection on your process]
+- Check for existing upstream PRs on the issue earlier before investing in a full implementation plan.
+- Clone large Flutter repos outside OneDrive-synced folders to avoid file-attribute issues.
 
 ---
 
 ## Resources Used
 
-- [BasedHardware/omi#5092 — Trash bin / soft delete feature request](https://github.com/BasedHardware/omi/issues/5092)
-- [Siriapps/omi fork — fix-issue-5092 branch](https://github.com/Siriapps/omi/tree/fix-issue-5092)
-- Omi commit `d3a2aa6cf` — "No more soft-delete on database #2515" (historical context for `deleted_at` decision)
-- `backend/migration/remove_soft_deleted_documents.py` — existing purge migration that blocks reuse of `deleted: bool`
-- Local `implementation_plan.md` — full file-level implementation plan for Phase III
+- [BasedHardware/omi#5092](https://github.com/BasedHardware/omi/issues/5092)
+- [Siriapps/omi — fix-issue-5092](https://github.com/Siriapps/omi/tree/fix-issue-5092)
+- Omi commit `d3a2aa6cf` — "No more soft-delete on database #2515"
+- Local `implementation_plan.md` — full file-level implementation plan
+
+---
+
+# Contribution 2: Bug: index out of bounds panic in FTS inverted index builder (#7313)
+
+**Contribution Number:** 2  
+**Student:** Lakshmi Siri Appalaneni  
+**Issue:** [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313)  
+**Status:** Phase II Complete
+
+---
+
+## Why I Chose This Issue
+
+After Contribution 1 stopped because another contributor submitted an upstream PR for the Omi Trash feature, I needed a new issue that was open, well-scoped, and technically clear. [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313) fits that profile: it is a concrete Rust bug in the FTS (full-text search) inverted index builder that panics during `table.optimize()` when position tracking is enabled (`with_position: true`, the default). The issue includes the exact panic message, production table examples, the file and function name, and a proposed fix direction. Lance is the core columnar format behind LanceDB, so fixing a crash during index optimization has real user impact. The fix is bounded to one function in `rust/lance-index`, which is a manageable scope for my first Rust OSS contribution.
+
+---
+
+## Understanding the Issue
+
+### Problem Description
+
+`IndexWorker::process_batch()` in `rust/lance-index/src/scalar/inverted/builder.rs` panics with `index out of bounds` when rebuilding an FTS inverted index with `with_position: true`. This was observed during `table.optimize()` / `optimize_indices()` on production LanceDB tables.
+
+### Expected Behavior
+
+When `tokens.add()` returns a `token_id`, the code should ensure `posting_lists` has a valid entry at that index **before** accessing `posting_lists[token_id]`. Indexing and optimization should complete without panicking.
+
+### Current Behavior
+
+In the `with_position` branch of `process_batch`, `posting_lists` is grown only when `token_id == posting_lists.len()` (exact equality). When `token_id > posting_lists.len()` — which happens when the token vocabulary and posting-list vector are out of sync (e.g. stale `next_id` from a legacy index partition) — the code skips growth and panics:
+
+```
+thread 'tokio-rt-worker' panicked at .../builder.rs:1344:66: index out of bounds: the len is 1731 but the index is 4456
+```
+
+### Affected Components
+
+- **Primary:** `IndexWorker::process_batch()` — `with_position` token loop (~lines 1320–1353)
+- **Secondary access:** `finish_open_doc` loop (~line 1405) — safe once the first loop resizes correctly
+- **Not affected:** Non-position branch (lines 1375–1384) already uses `resize_with(tokens.len(), ...)`
+- **Related prior fixes:** `merge_from` (line 979) and stale-`next_id` tests (lines 3890–3962) fixed similar mismatches on a different code path
+
+---
+
+## Reproduction Process
+
+### Environment Setup
+
+I forked [lance-format/lance](https://github.com/lance-format/lance) to [Siriapps/lance](https://github.com/Siriapps/lance) and cloned into `c:\Users\siria\OneDrive\Documents\code\lance` on Windows.
+
+**Blockers encountered and resolved:**
+
+1. **`protoc` / proto path failure** — Git symlink stubs at `rust/*/protos` (pointing to `../../protos/`) do not resolve on Windows; `cargo check` failed with `Could not make proto path relative: ./protos/encodings_v2_0.proto`.
+   - **Fix:** Created Windows directory junctions from each `rust/*/protos` to the repo-root `protos/` folder. Re-run `git restore rust/*/protos` after builds to keep the working tree clean; recreate junctions before the next `cargo` command.
+2. **First `cargo check` compile time** — Full workspace compile on Windows took ~6 minutes (expected for first build).
+
+**Current status:** `cargo check -p lance-index` succeeds. Working branch: [`fix-issue-7313`](https://github.com/Siriapps/lance/tree/fix-issue-7313). Reproduction test committed as `240045ec`.
+
+### Steps to Reproduce
+
+1. Fork [lance-format/lance](https://github.com/lance-format/lance) and clone your fork.
+2. On Windows, create proto junctions (see Environment Setup above).
+3. Create branch: `git checkout -b fix-issue-7313` and push to your fork.
+4. Verify build: `cargo check -p lance-index`
+5. Run the reproduction test:
+
+```bash
+cargo test -p lance-index test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len -- --nocapture
+```
+
+6. **Observed result (current main / pre-fix):** Test passes via `#[should_panic]` — worker panics with:
+
+```
+index out of bounds: the len is 1731 but the index is 4456
+```
+
+7. **How the test simulates production:** It pre-populates `worker.builder` with 1731 tokens, sets stale `tokens.next_id = 4456` (mimicking legacy FTS partitions), sizes `posting_lists` to 1731, then calls `process_batch` with a new unseen token. `tokens.add()` assigns id 4456; the `==` guard does not grow the vector; line 1344 panics.
+
+### Reproduction Evidence
+
+- **Branch link:** https://github.com/Siriapps/lance/tree/fix-issue-7313
+- **Commit:** `240045ec` — `test: reproduce FTS posting_lists index panic for issue #7313`
+- **Test file:** `rust/lance-index/src/scalar/inverted/builder.rs` — `test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len`
+- **Panic location:** `builder.rs:1344` — `&mut builder.posting_lists[token_id as usize]`
+
+---
+
+## Solution Approach
+
+### Analysis
+
+**Root cause:** The `with_position` and `!with_position` branches in `process_batch` use different strategies for keeping `posting_lists` in sync with `tokens`:
+
+| Branch | Strategy | Handles `token_id > len`? |
+|--------|----------|---------------------------|
+| `with_position` (buggy) | Grow only when `token_id == len`, single push | No |
+| `!with_position` (correct) | `resize_with(tokens.len(), ...)` after tokenizing | Yes |
+
+**Why `token_id` can exceed `len`:** `TokenSet::add()` returns `next_id` for new tokens. If `next_id` is stale (higher than the number of posting lists built so far) — from legacy index partitions written before #7115, or from a vocabulary/posting-list desync during optimize — the equality check fails and the vector is never grown to the required size.
+
+**Why the issue's suggested fix (`==` → `>=` + one push) is insufficient:** For `len=1731` and `token_id=4456`, one push yields `len=1732` — still out of bounds at index 4456. The correct approach is `resize_with(token_id + 1, ...)` to fill the entire gap.
+
+**Prior art in the same file:**
+
+- `merge_from` line 979: `self.posting_lists.resize_with(self.tokens.len(), ...)`
+- `test_merge_from_after_remap_does_not_panic` (line 3853)
+- `test_merge_with_stale_next_id_token_file_does_not_panic` (line 3925)
+
+### Proposed Solution
+
+Replace the `==` + single `push` block in the `with_position` token loop with `resize_with(token_idx + 1, ...)`, preserving the existing `memory_size` overhead tracking. No Python/Java binding changes — logic stays in Rust core per Lance AGENTS.md.
+
+### Implementation Plan
+
+Using UMPIRE framework (adapted):
+
+**Understand:** FTS index rebuild panics when `with_position=true` because `posting_lists` is not grown before indexed access when `token_id > posting_lists.len()`.
+
+**Match:** Non-position branch (`resize_with`), `merge_from` (`resize_with`), stale-`next_id` regression tests.
+
+**Plan — Step by step** (single file: `rust/lance-index/src/scalar/inverted/builder.rs`):
+
+**Step 1 — Fix resize guard (~lines 1325–1342)**
+
+Replace:
+
+```rust
+if token_id as usize == builder.posting_lists.len() {
+    let old_posting_lists_overhead_size = ...;
+    builder.posting_lists.push(
+        PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec),
+    );
+    let new_posting_lists_overhead_size = ...;
+    Self::adjust_tracked_value(memory_size, old, new);
+}
+```
+
+With:
+
+```rust
+let token_idx = token_id as usize;
+if token_idx >= builder.posting_lists.len() {
+    let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
+        * std::mem::size_of::<PostingListBuilder>()) as u64;
+    builder.posting_lists.resize_with(token_idx + 1, || {
+        PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec)
+    });
+    let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
+        * std::mem::size_of::<PostingListBuilder>()) as u64;
+    Self::adjust_tracked_value(
+        memory_size,
+        old_posting_lists_overhead_size,
+        new_posting_lists_overhead_size,
+    );
+}
+```
+
+**Step 2 — Flip reproduction test (~lines 3753–3797)**
+
+- Rename: `test_process_batch_with_position_panics_...` → `test_process_batch_with_position_handles_token_id_gaps`
+- Remove: `#[should_panic(expected = "index out of bounds")]`
+- Add after `process_batch`:
+
+```rust
+let new_token_id = worker.builder.tokens.get("unseen_token_xyz").expect("new token indexed");
+assert!((new_token_id as usize) < worker.builder.posting_lists.len());
+assert_eq!(worker.builder.posting_lists.len(), 4457);
+```
+
+**Step 3 — Verify**
+
+```bash
+cargo test -p lance-index test_process_batch_with_position_handles_token_id_gaps -- --nocapture
+cargo test -p lance-index test_worker_trims_position_temp_buffers
+cargo test -p lance-index test_worker_flush_keeps_position_temp_memory_bounded
+cargo test -p lance-index
+cargo fmt --all
+cargo clippy -p lance-index --tests -- -D warnings
+```
+
+**Step 4 — Commit and push**
+
+```bash
+git commit -m "fix: grow posting_lists before indexed access in FTS with_position builder"
+git push origin fix-issue-7313
+```
+
+**Implement:** https://github.com/Siriapps/lance/tree/fix-issue-7313 (Phase III commits pending)
+
+**Review:** Before PR — Conventional Commits title (`fix:`), no drive-by changes, tests required per AGENTS.md.
+
+**Evaluate:**
+
+- New regression test passes (no panic)
+- Existing position worker tests pass
+- Full `cargo test -p lance-index` passes
+- `cargo fmt` and `cargo clippy` clean
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+
+- [x] `test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len` — reproduces #7313 (Phase II)
+- [ ] `test_process_batch_with_position_handles_token_id_gaps` — confirms fix (Phase III)
+- [ ] Existing: `test_worker_trims_position_temp_buffers`, `test_worker_flush_keeps_position_temp_memory_bounded`
+- [ ] Existing: `test_merge_from_after_remap_does_not_panic`, `test_merge_with_stale_next_id_token_file_does_not_panic`
+
+### Integration Tests
+
+- Not required for this fix — unit test covers the exact panic path; production scenario (`optimize_indices` on legacy FTS tables) is impractical to replicate locally.
+
+### Manual Testing
+
+N/A — Rust unit test is sufficient for this bounded vector-index bug.
+
+---
+
+## Implementation Notes
+
+### Week 2 Progress (Phase II)
+
+- Selected issue #7313 after Contribution 1 stopped.
+- Created branch `fix-issue-7313`, pushed to [Siriapps/lance](https://github.com/Siriapps/lance).
+- Resolved Windows proto junction blocker.
+- Added and ran reproduction test; confirmed exact panic: `the len is 1731 but the index is 4456`.
+- Documented fix plan: `resize_with(token_idx + 1)` not `>=` + single push.
+
+### Code Changes (Phase II only)
+
+- **File:** `rust/lance-index/src/scalar/inverted/builder.rs`
+- **Commit:** `240045ec` — reproduction test only (no fix yet)
+
+---
+
+## Pull Request
+
+**PR Link:** Not yet submitted — awaiting review before opening upstream PR
+
+**Draft PR title:** `fix: grow posting_lists before indexed access in FTS with_position builder`
+
+**Draft PR body:**
+
+> Fixes #7313  
+> Replaces `token_id == posting_lists.len()` + single push with `resize_with(token_id + 1, ...)` in the `with_position` branch of `IndexWorker::process_batch`  
+> Adds regression test for stale `next_id` / posting-list length mismatch
+
+**Maintainer Feedback:**
+
+- (none yet)
+
+**Status:** Phase II Complete — fix implementation pending
+
+---
+
+## Learnings & Reflections
+
+### Technical Skills Gained
+
+- Reading Rust FTS index builder code (`IndexWorker`, `TokenSet`, `PostingListBuilder`).
+- Writing `#[tokio::test]` reproduction tests with `#[should_panic]`.
+- Windows-specific OSS setup (proto symlink → junction workaround).
+
+### Challenges Overcome
+
+- Git symlink stubs not resolving on Windows for `protoc` build.
+- Understanding why `>=` + one push is insufficient for large token ID gaps.
+
+### What I'd Do Differently Next Time
+
+- Check for platform-specific build issues (symlinks) earlier in environment setup.
+- Verify issue-suggested fix against worst-case production numbers before implementing.
+
+---
+
+## Resources Used
+
+- [lance-format/lance#7313](https://github.com/lance-format/lance/issues/7313)
+- [Siriapps/lance — fix-issue-7313](https://github.com/Siriapps/lance/tree/fix-issue-7313)
+- Lance `rust/lance-index/src/scalar/inverted/builder.rs` — `process_batch`, `merge_from`, stale-`next_id` tests
+- Lance AGENTS.md — testing and PR conventions
